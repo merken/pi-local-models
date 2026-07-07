@@ -4,3 +4,4 @@ package
 .DS_Store
 *.tgz
 package-lock.json
+.npmrc
