@@ -1,0 +1,17 @@
+{
+    "name": "pi-local-models",
+    "version": "0.1.0",
+    "description": "Pi extension for any local model harness - model discovery, auto-load, per-project config",
+    "license": "MIT",
+    "keywords": [
+        "pi-package"
+    ],
+    "peerDependencies": {
+        "@mariozechner/pi-coding-agent": "*"
+    },
+    "pi": {
+        "extensions": [
+            "./extensions/local-models.ts"
+        ]
+    }
+}

@@ -1,0 +1,11 @@
+{
+    "url": "http://ai.local:8700",
+    "apiKey": "1234",
+    "contextWindow": 190000,
+    "maxTokens": 65000,
+    "reasoning": true,
+    "input": [
+        "text",
+        "image"
+    ]
+}
