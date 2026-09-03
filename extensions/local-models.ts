@@ -150,7 +150,7 @@ export default async function (pi: ExtensionAPI) {
         name: String(m.id),
         reasoning: config.reasoning,
         input: config.input,
-        contextWindow: config.contextWindow ?? m.max_model_len ?? DEFAULT_CTX_WINDOW,
+        contextWindow: m.max_model_len ?? config.contextWindow ?? DEFAULT_CTX_WINDOW,
         maxTokens: config.maxTokens,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         compat: {
