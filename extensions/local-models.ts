@@ -34,8 +34,13 @@ interface LoadingPayload {
 interface ServerModel {
     id: string;
     state?: string;
-    context_length?: number;
-    max_model_len?: number;
+    max_model_len?: number;      // Used by vLLM
+    context_length?: number;     // Used by LM Studio / OpenRouter
+    max_context_length?: number; // Alternative context length field
+    meta?: {                     // Used by llama.cpp / llama-server
+        n_ctx?: number;
+        n_ctx_train?: number;
+    };
     payload?: LoadingPayload;
     status?: {
         value?: string;
@@ -113,7 +118,7 @@ function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: stri
         if (hasApiKey)
             headers = postHeadersWithApiKey;
         else
-            headers = postHeaders
+            headers = postHeaders;
     }
 
     return fetch(`${config.url}${endpoint}`, {
@@ -146,19 +151,27 @@ export default async function (pi: ExtensionAPI) {
 
     console.log('\x1b[36m%s\x1b[0m', "local-models: " + serverModels.length + " local models were discovered, type /model to select a [local-model]");
 
-    const models = serverModels.map((m) => ({
-        id: String(m.id),
-        name: String(m.id),
-        reasoning: config.reasoning,
-        input: config.input,
-        contextWindow: m.context_length ?? m.max_model_len ?? config.contextWindow ?? DEFAULT_CTX_WINDOW,
-        maxTokens: config.maxTokens,
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        compat: {
-            supportsDeveloperRole: false,
-            supportsReasoningEffort: false,
-        }
-    }));
+    const models = serverModels.map((m) => {
+        // Resolve context window across different inference backends:
+        // 1. m.meta?.n_ctx -> llama.cpp / llama-server
+        // 2. m.max_model_len -> vLLM / OpenAI standard extensions
+        // 3. m.context_length / m.max_context_length -> LM Studio / LocalAI / OpenRouter
+        const detectedCtx = m.meta?.n_ctx ?? m.max_model_len ?? m.context_length ?? m.max_context_length;
+
+        return {
+            id: String(m.id),
+            name: String(m.id),
+            reasoning: config.reasoning,
+            input: config.input,
+            contextWindow: config.contextWindow ?? detectedCtx ?? DEFAULT_CTX_WINDOW,
+            maxTokens: config.maxTokens,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            compat: {
+                supportsDeveloperRole: false,
+                supportsReasoningEffort: false,
+            }
+        };
+    });
 
     pi.registerProvider("local-model", {
         baseUrl: `${config.url}/v1`,
