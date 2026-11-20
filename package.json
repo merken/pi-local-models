@@ -11,7 +11,7 @@
         "pi-package"
     ],
     "peerDependencies": {
-        "@earendil-works/pi-coding-agent": "^1.5.2"
+        "@earendil-works/pi-coding-agent": "^1.5.0"
     },
     "devDependencies": {
         "typescript": "^7.0.2"
