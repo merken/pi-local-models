@@ -19,6 +19,7 @@ import extension, {
     modelReasoning,
     normalizeModels,
     readConfig,
+    sortModels,
     toProviderModelConfig,
     type LocalModelsConfig,
     type ServerModel,
@@ -52,29 +53,28 @@ function config(overrides: Partial<LocalModelsConfig> = {}): LocalModelsConfig {
     return {
         url: "http://127.0.0.1:8000",
         apiKey: "1234",
+        apiKeyHeader: "both",
         contextWindow: 190000,
         maxTokens: 65000,
         reasoning: true,
         input: ["text", "image"],
+        timeoutMs: 5000,
+        retry: { attempts: 1, delayMs: 0 },
+        contextProbe: false,
+        configPath: "",
         ...overrides,
     };
 }
 
-const testConfig: LocalModelsConfig = {
-    url: "http://127.0.0.1:8000",
-    apiKey: "1234",
-    contextWindow: 190000,
-    maxTokens: 65000,
-    reasoning: true,
-    input: ["text", "image"],
-};
+const testConfig: LocalModelsConfig = config();
 
-// Normalized and mapped models for one provider response.
+// Normalized and mapped models for one provider response, in picker order.
 function registeredModels(name: string, cfg: LocalModelsConfig = config()): ChatModel[] {
-    return normalizeModels(fixture(name))
-        .map((model) => toProviderModelConfig(model, cfg))
-        .filter((model): model is ProviderModelConfig => model !== undefined)
-        .map((model) => model as ChatModel);
+    return sortModels(
+        normalizeModels(fixture(name))
+            .map((model) => toProviderModelConfig(model, cfg))
+            .filter((model): model is ProviderModelConfig => model !== undefined),
+    ) as ChatModel[];
 }
 
 function byId(models: ChatModel[], id: string): ChatModel {
@@ -115,15 +115,55 @@ function writeConfig(dir: string, cfg: object): void {
     writeFileSync(join(agentDir, "local-models.json"), JSON.stringify(cfg));
 }
 
-function stubFetch(payload: unknown): typeof fetch {
-    return ((url: string, options: { method?: string; headers?: HeadersInit; signal?: AbortSignal }) => {
+function stubFetch(payloadOrResolver: unknown | ((url: string, attempt: number) => unknown)): typeof fetch {
+    const attempts = new Map<string, number>();
+    return ((url: string, options: { method?: string; headers?: HeadersInit; signal?: AbortSignal } = {}) => {
+        const attempt = (attempts.get(url) ?? 0) + 1;
+        attempts.set(url, attempt);
         requests.push({
             url,
             method: options.method ?? "GET",
             headers: (options.headers ?? {}) as Record<string, string>,
             signal: options.signal,
         });
-        return Promise.resolve({ ok: true, json: () => payload, text: () => JSON.stringify(payload) } as unknown as Response);
+        const payload = typeof payloadOrResolver === "function" ? (payloadOrResolver as (url: string, attempt: number) => unknown)(url, attempt) : payloadOrResolver;
+        if (payload instanceof Error) return Promise.reject(payload);
+        if (payload && typeof payload === "object" && "__status" in payload) {
+            const status = Number((payload as { __status: unknown }).__status);
+            const body = (payload as { body?: unknown }).body ?? "";
+            return Promise.resolve({ ok: false, status, json: () => body, text: () => String(body) } as unknown as Response);
+        }
+        return Promise.resolve({ ok: true, status: 200, json: () => payload, text: () => JSON.stringify(payload) } as unknown as Response);
+    }) as unknown as typeof fetch;
+}
+
+// A stub that never answers. Used to test the discovery timeout.
+function stubFetchNeverResponds(): typeof fetch {
+    return ((url: string, options: { method?: string; headers?: HeadersInit; signal?: AbortSignal } = {}) => {
+        requests.push({ url, method: options.method ?? "GET", headers: (options.headers ?? {}) as Record<string, string>, signal: options.signal });
+        return new Promise<Response>((_resolve, reject) => {
+            options.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+    }) as unknown as typeof fetch;
+}
+
+// A stub that answers at once, then reads the body slowly.
+function stubFetchSlowBody(payload: unknown, bodyDelayMs: number): typeof fetch {
+    return ((url: string, options: { method?: string; headers?: HeadersInit; signal?: AbortSignal } = {}) => {
+        requests.push({ url, method: options.method ?? "GET", headers: (options.headers ?? {}) as Record<string, string>, signal: options.signal });
+        return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: () =>
+                new Promise((resolve, reject) => {
+                    const timer = setTimeout(() => resolve(payload), bodyDelayMs);
+                    options.signal?.addEventListener("abort", () => {
+                        clearTimeout(timer);
+                        reject(new Error("body read aborted"));
+                    });
+                }),
+            text: () => "",
+        } as unknown as Response);
     }) as unknown as typeof fetch;
 }
 
@@ -160,7 +200,7 @@ function fakeApi(pi: FakePi): ExtensionAPI {
 // Load the extension with a stubbed /v1/models response and a temp config file.
 async function loadExtension(configFile: object, payload: unknown, dir?: string): Promise<{ pi: FakePi; dir: string }> {
     const workDir = dir ?? mkdtempSync(join(tmpdir(), "pi-local-models-"));
-    writeConfig(workDir, configFile);
+    writeConfig(workDir, { retry: { attempts: 1, delayMs: 0 }, contextProbe: false, ...configFile });
     const pi = fakePi();
     requests = [];
     await runWithStub(workDir, stubFetch(payload), async () => {
@@ -309,8 +349,8 @@ test("ollama: models[] entries use the name as the id", () => {
     const models = registeredModels("ollama.json");
     assert.equal(models.length, 2);
     models.forEach(assertChatModel);
-    assert.equal(models[0].id, "llama3.2:latest");
-    assert.equal(models[0].name, "llama3.2:latest");
+    const plain = byId(models, "llama3.2:latest");
+    assert.equal(plain.name, "llama3.2:latest");
 });
 
 test("ollama: context and modalities fall back to the config", () => {
@@ -417,7 +457,7 @@ test("readConfig: the trailing /v1 is removed and defaults are applied", () => {
 
 test("readConfig: input keeps only text and image", () => {
     const dir = mkdtempSync(join(tmpdir(), "pi-local-models-config-"));
-    writeConfig(dir, { url: "http://ai.local:8700", apiKey: "1234", contextWindow: 190000, maxTokens: 65000, reasoning: true, input: ["text", "image", "pdf", "audio"] });
+    writeConfig(dir, { url: "http://ai.local:8700", apiKey: "1234", apiKeyHeader: "both", contextWindow: 190000, maxTokens: 65000, reasoning: true, input: ["text", "image", "pdf", "audio"] });
     const cfg = readConfig(dir);
     assert.deepEqual(cfg.input, ["text", "image"]);
     assert.equal(cfg.contextWindow, 190000);
@@ -494,13 +534,16 @@ for (const provider of providers) {
     });
 }
 
-test("refreshModels: the abort signal is passed to fetch", async () => {
+test("refreshModels: the abort signal reaches fetch", async () => {
     const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
     const controller = new AbortController();
     requests = [];
-    await runWithStub(dir, stubFetch(fixture("omlx.json")), () => refreshModels(pi, controller.signal));
-    assert.equal(requests[requests.length - 1].url, "http://127.0.0.1:8000/v1/models");
-    assert.equal(requests[requests.length - 1].signal, controller.signal);
+    const pending = runWithStub(dir, stubFetchNeverResponds(), () => refreshModels(pi, controller.signal));
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(pending, /aborted/);
+    assert.ok(requests[0].signal, "the request carries an abort signal");
+    assert.ok(requests[0].signal!.aborted, "the caller abort propagates to the request");
 });
 
 test("refreshModels: an unreachable engine reports the error", async () => {
@@ -528,7 +571,7 @@ test("/local-models-refresh: the command is registered", async () => {
 
 test("/local-models-refresh: models discovered after startup are added", async () => {
     const { pi, dir } = await loadExtension(testConfig, { object: "list", data: [] });
-    assert.equal(pi.providers.get(PROVIDER_NAME)!.models!.length, 0, "no models at startup");
+    assert.ok(!pi.providers.has(PROVIDER_NAME), "nothing is registered when the engine had no models");
 
     const { notices, ctx } = commandContext(pi);
     await runWithStub(dir, stubFetch(fixture("omlx.json")), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
@@ -538,6 +581,17 @@ test("/local-models-refresh: models discovered after startup are added", async (
     assert.equal(notices.length, 1);
     assert.ok(notices[0].startsWith("info: local-models: refreshed 8 model(s)"), notices[0]);
     assert.ok(notices[0].includes("/model"), "the notice points the user to /model");
+});
+
+test("startup: an unreachable engine registers no provider", async () => {
+    const dir = tempDir("pi-local-models-unreachable-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 1, delayMs: 0 }, contextProbe: false });
+    const pi = fakePi();
+    requests = [];
+    await runWithStub(dir, stubFetch(() => new Error("fetch failed: ECONNREFUSED")), () => extension(fakeApi(pi)));
+    assert.equal(pi.providers.size, 0, "no provider without models");
+    assert.ok(pi.commands.has("local-models-refresh"), "the refresh command is still available");
+    assert.ok(pi.commands.has("local-models"), "the info command is still available");
 });
 
 test("/local-models-refresh: a replaced catalog is reported", async () => {
@@ -604,6 +658,342 @@ test("/local-models-refresh: the provider is created when the config appeared af
         assert.equal(models.length, 1);
         assert.equal(models[0].name, "Qwen3.6-35B-A3B-UD-Q4_K_M");
         assert.ok(notices[0].includes("refreshed 1 model(s)"), notices[0]);
+    } finally {
+        process.chdir(originalCwd);
+        process.env.HOME = originalHome;
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+function chatModels(models: ProviderModelConfig[]): ChatModel[] {
+    return models.map((model) => model as ChatModel);
+}
+
+function tempDir(prefix: string): string {
+    return mkdtempSync(join(tmpdir(), prefix));
+}
+
+test("readConfig: the provider has a display name", async () => {
+    const { pi } = await loadExtension(testConfig, fixture("omlx.json"));
+    assert.equal(pi.providers.get(PROVIDER_NAME)?.name, "Local models");
+});
+
+test("readConfig: a file without a url is an error", () => {
+    const dir = tempDir("pi-local-models-no-url-");
+    writeConfig(dir, { maxTokens: 100 });
+    assert.throws(() => readConfig(dir), /must set "url"/);
+});
+
+test("readConfig: a url without a scheme is an error", () => {
+    const dir = tempDir("pi-local-models-no-scheme-");
+    writeConfig(dir, { url: "127.0.0.1:8080" });
+    assert.throws(() => readConfig(dir), /invalid "url"/);
+});
+
+test("readConfig: apiKey needs an apiKeyHeader", () => {
+    const dir = tempDir("pi-local-models-no-header-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", apiKey: "1234" });
+    assert.throws(() => readConfig(dir), /sets "apiKey" but no "apiKeyHeader"/);
+});
+
+test("readConfig: apiKeyHeader must be bearer, x-api-key, or both", () => {
+    for (const value of ["api-key", "Bearer", "", null]) {
+        const dir = tempDir("pi-local-models-bad-header-");
+        writeConfig(dir, { url: "http://127.0.0.1:8000", apiKey: "1234", apiKeyHeader: value });
+        assert.throws(() => readConfig(dir), /invalid "apiKeyHeader"/, `rejects ${JSON.stringify(value)}`);
+    }
+});
+
+test("readConfig: apiKeyHeader is optional when there is no apiKey", () => {
+    const dir = tempDir("pi-local-models-header-no-key-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", apiKeyHeader: "bearer" });
+    const cfg = readConfig(dir);
+    assert.equal(cfg.apiKey, undefined);
+    assert.equal(cfg.apiKeyHeader, "bearer");
+});
+
+test("readConfig: an empty apiKey needs no apiKeyHeader", () => {
+    const dir = tempDir("pi-local-models-empty-key-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", apiKey: "" });
+    const cfg = readConfig(dir);
+    assert.equal(cfg.apiKey, undefined);
+    assert.equal(cfg.apiKeyHeader, "both");
+});
+
+test("readConfig: broken json is reported with the file path", () => {
+    const dir = tempDir("pi-local-models-broken-json-");
+    mkdirSync(join(dir, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(dir, ".pi", "agent", "local-models.json"), "{ url: http://127.0.0.1:8000, }");
+    assert.throws(() => readConfig(dir), /is not valid JSON/);
+});
+
+test("readConfig: $VAR and ${VAR} are expanded in url and apiKey", () => {
+    const dir = tempDir("pi-local-models-env-");
+    process.env.LOCAL_MODELS_TEST_URL = "http://127.0.0.1:9099";
+    process.env.LOCAL_MODELS_TEST_KEY = "secret";
+    try {
+        writeConfig(dir, { url: "$LOCAL_MODELS_TEST_URL/v1", apiKey: "${LOCAL_MODELS_TEST_KEY}", apiKeyHeader: "both" });
+        const cfg = readConfig(dir);
+        assert.equal(cfg.url, "http://127.0.0.1:9099");
+        assert.equal(cfg.apiKey, "secret");
+    } finally {
+        delete process.env.LOCAL_MODELS_TEST_URL;
+        delete process.env.LOCAL_MODELS_TEST_KEY;
+    }
+});
+
+test("readConfig: an unset variable makes the url invalid", () => {
+    const dir = tempDir("pi-local-models-missing-env-");
+    writeConfig(dir, { url: "$LOCAL_MODELS_NOT_SET" });
+    assert.throws(() => readConfig(dir), /invalid "url": \$LOCAL_MODELS_NOT_SET/);
+});
+
+test("readConfig: timeout, retry, auth, and probe defaults", () => {
+    const dir = tempDir("pi-local-models-defaults-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000" });
+    const cfg = readConfig(dir);
+    assert.equal(cfg.timeoutMs, 10000);
+    assert.deepEqual(cfg.retry, { attempts: 3, delayMs: 1500 });
+    assert.equal(cfg.apiKeyHeader, "both");
+    assert.equal(cfg.contextProbe, true);
+    assert.equal(cfg.maxTokensField, undefined);
+    assert.equal(cfg.configPath, join(dir, ".pi", "agent", "local-models.json"));
+});
+
+test("readConfig: bad numbers fall back to the defaults", () => {
+    const dir = tempDir("pi-local-models-bad-numbers-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", maxTokens: 0, timeoutMs: -5, retry: { attempts: "many", delayMs: -1 } });
+    const cfg = readConfig(dir);
+    assert.equal(cfg.maxTokens, 16384);
+    assert.equal(cfg.timeoutMs, 10000);
+    assert.deepEqual(cfg.retry, { attempts: 3, delayMs: 1500 });
+});
+
+// ---------------------------------------------------------------------------
+// Auth headers
+// ---------------------------------------------------------------------------
+
+test("auth: discovery sends a bearer token and x-api-key", async () => {
+    const dir = tempDir("pi-local-models-auth-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", apiKey: "1234", apiKeyHeader: "both", retry: { attempts: 1, delayMs: 0 } });
+    requests = [];
+    await runWithStub(dir, stubFetch(fixture("omlx.json")), () => discoverModels(readConfig(dir)));
+    assert.equal(requests[0].headers.Authorization, "Bearer 1234");
+    assert.equal(requests[0].headers["x-api-key"], "1234");
+});
+
+test("auth: apiKeyHeader selects one header", async () => {
+    for (const [header, expected] of [["bearer", "Authorization"], ["x-api-key", "x-api-key"]] as const) {
+        const dir = tempDir("pi-local-models-header-");
+        writeConfig(dir, { url: "http://127.0.0.1:8000", apiKey: "1234", apiKeyHeader: header, retry: { attempts: 1, delayMs: 0 } });
+        requests = [];
+        await runWithStub(dir, stubFetch(fixture("omlx.json")), () => discoverModels(readConfig(dir)));
+        assert.ok(requests[0].headers[expected], `${header} sends ${expected}`);
+        const other = expected === "Authorization" ? "x-api-key" : "Authorization";
+        assert.equal(requests[0].headers[other], undefined, `${header} does not send ${other}`);
+    }
+});
+
+test("auth: no apiKey means no auth headers", async () => {
+    const dir = tempDir("pi-local-models-no-key-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 1, delayMs: 0 } });
+    requests = [];
+    await runWithStub(dir, stubFetch(fixture("omlx.json")), () => discoverModels(readConfig(dir)));
+    assert.deepEqual(requests[0].headers, {});
+});
+
+// ---------------------------------------------------------------------------
+// Timeout and retry
+// ---------------------------------------------------------------------------
+
+test("discovery: a hung engine times out", async () => {
+    const dir = tempDir("pi-local-models-timeout-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", timeoutMs: 50, retry: { attempts: 3, delayMs: 1000 } });
+    requests = [];
+    const cfg = readConfig(dir);
+    await runWithStub(dir, stubFetchNeverResponds(), async () => {
+        await assert.rejects(() => discoverModels(cfg), /no response from http:\/\/127\.0\.0\.1:8000\/v1\/models within 50ms/);
+    });
+    assert.equal(requests.length, 1, "a timeout is not retried");
+});
+
+test("timeout: the timer stops when the engine answers", async () => {
+    const dir = tempDir("pi-local-models-slow-body-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", timeoutMs: 50, retry: { attempts: 1, delayMs: 0 } });
+    requests = [];
+    // The response arrives at once. Reading the body takes 200ms, which is longer than
+    // the timeout, and that is fine: the timeout only covers the response.
+    const models = chatModels(
+        await runWithStub(dir, stubFetchSlowBody(fixture("omlx.json"), 200), () => discoverModels(readConfig(dir))),
+    );
+    assert.equal(models.length, 8, "the body is read after the response arrives");
+});
+
+test("discovery: a refused connection is retried", async () => {
+    const dir = tempDir("pi-local-models-retry-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 3, delayMs: 10 } });
+    requests = [];
+    const models = chatModels(await runWithStub(
+        dir,
+        stubFetch((url: string, attempt: number) => (attempt < 3 ? new Error("fetch failed: ECONNREFUSED") : fixture("omlx.json"))),
+        () => discoverModels(readConfig(dir)),
+    ));
+    assert.equal(requests.length, 3, "two failed attempts then a success");
+    assert.equal(models.length, 8);
+});
+
+test("discovery: a 401 is not retried", async () => {
+    const dir = tempDir("pi-local-models-401-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 3, delayMs: 10 } });
+    requests = [];
+    await runWithStub(dir, stubFetch({ __status: 401, body: "invalid key" }), async () => {
+        await assert.rejects(() => discoverModels(readConfig(dir)), /401: invalid key/);
+    });
+    assert.equal(requests.length, 1, "a bad key is reported at once");
+});
+
+test("discovery: the abort signal stops the retry loop", async () => {
+    const dir = tempDir("pi-local-models-abort-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 5, delayMs: 5000 } });
+    const controller = new AbortController();
+    requests = [];
+    const pending = runWithStub(dir, stubFetch(() => new Error("fetch failed: ECONNREFUSED")), () =>
+        discoverModels(readConfig(dir), controller.signal),
+    );
+    controller.abort();
+    await assert.rejects(pending, /fetch failed|refresh cancelled/);
+    assert.equal(requests.length, 1, "the retry loop stops at the abort");
+});
+
+// ---------------------------------------------------------------------------
+// Context length probe
+// ---------------------------------------------------------------------------
+
+test("probe: /api/show fills a missing context length", async () => {
+    const dir = tempDir("pi-local-models-probe-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", contextProbe: true, retry: { attempts: 1, delayMs: 0 } });
+    requests = [];
+    const models = chatModels(await runWithStub(
+        dir,
+        stubFetch((url: string) => (url.endsWith("/api/show") ? { model: { context_length: 4096 } } : fixture("ollama.json"))),
+        () => discoverModels(readConfig(dir)),
+    ));
+    assert.equal(requests.filter((request) => request.url.endsWith("/api/show")).length, 2);
+    models.forEach((model) => assert.equal(model.contextWindow, 4096));
+    assert.equal(requests[0].method, "GET", "/v1/models is still a GET");
+    assert.equal(requests[1].method, "POST", "/api/show is a POST");
+});
+
+test("probe: a reported context length is not probed", async () => {
+    const dir = tempDir("pi-local-models-probe-skip-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", contextProbe: true, retry: { attempts: 1, delayMs: 0 } });
+    requests = [];
+    await runWithStub(dir, stubFetch(fixture("llamacpp.json")), () => discoverModels(readConfig(dir)));
+    assert.equal(requests.length, 1, "llama.cpp reports n_ctx, so no probe is needed");
+});
+
+test("probe: a failed probe does not break discovery", async () => {
+    const dir = tempDir("pi-local-models-probe-fail-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", contextProbe: true, retry: { attempts: 1, delayMs: 0 } });
+    const models = chatModels(await runWithStub(
+        dir,
+        stubFetch((url: string) => (url.endsWith("/api/show") ? { __status: 404, body: "not found" } : fixture("ollama.json"))),
+        () => discoverModels(readConfig(dir)),
+    ));
+    assert.equal(models.length, 2);
+    models.forEach((model) => assert.equal(model.contextWindow, 128000, "the default context window is used"));
+});
+
+// ---------------------------------------------------------------------------
+// Thinking levels, ids, compat, and order
+// ---------------------------------------------------------------------------
+
+test("thinking levels: splash efforts become thinkingLevelMap", () => {
+    const model = toProviderModelConfig({ id: "reasoning-model", reasoning: { thinks: true, efforts: ["low", "medium", "high"] } }, config()) as ChatModel | undefined;
+    assert.deepEqual(model?.thinkingLevelMap, { low: "low", medium: "medium", high: "high" });
+
+    const noEfforts = toProviderModelConfig({ id: "plain-model", reasoning: { thinks: true, efforts: [] } }, config()) as ChatModel | undefined;
+    assert.equal(noEfforts?.thinkingLevelMap, undefined, "no efforts means no thinking levels");
+});
+
+test("compat: maxTokensField comes from the config", () => {
+    const model = toProviderModelConfig({ id: "local-model", name: "local-model" }, config({ maxTokensField: "max_completion_tokens" })) as ChatModel | undefined;
+    assert.equal((model?.compat as { maxTokensField?: string } | undefined)?.maxTokensField, "max_completion_tokens");
+    const plain = toProviderModelConfig({ id: "local-model", name: "local-model" }, config()) as ChatModel | undefined;
+    assert.equal((plain?.compat as { maxTokensField?: string } | undefined)?.maxTokensField, undefined);
+});
+
+test("ids: a clean llama.cpp alias replaces the file path", () => {
+    const models = registeredModels("llamacpp-alias.json", config());
+    assert.equal(models.length, 1);
+    assert.equal(models[0].id, "qwen3.6-35b-a3b");
+    assert.equal(models[0].name, "Qwen3.6-35B-A3B-UD-Q4_K_M");
+    assert.equal(models[0].contextWindow, 131072);
+    assert.deepEqual(models[0].input, ["text", "image"]);
+});
+
+test("ids: a path with no clean alias keeps the path", () => {
+    const model = toProviderModelConfig({ id: "/workspace/models/model.gguf", aliases: ["/workspace/models/model.gguf"] }, config());
+    assert.equal(model?.id, "/workspace/models/model.gguf");
+});
+
+test("order: discovered models are sorted by name", async () => {
+    const dir = tempDir("pi-local-models-order-");
+    writeConfig(dir, { url: "http://127.0.0.1:8000", retry: { attempts: 1, delayMs: 0 }, contextProbe: false });
+    const models = chatModels(await runWithStub(dir, stubFetch(fixture("omlx.json")), () => discoverModels(readConfig(dir))));
+    const names = models.map((model) => model.name);
+    assert.deepEqual(names, [...names].sort((a, b) => a.localeCompare(b)));
+});
+
+// ---------------------------------------------------------------------------
+// /local-models
+// ---------------------------------------------------------------------------
+
+test("/local-models: the command is registered", async () => {
+    const { pi } = await loadExtension(testConfig, fixture("omlx.json"));
+    const command = pi.commands.get("local-models");
+    assert.ok(command, "the command is registered");
+    assert.ok(command.description, "the command has a description");
+});
+
+test("/local-models: prints the catalog with engine details", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("llamacpp-alias.json"));
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubFetch(fixture("llamacpp-alias.json")), () => pi.commands.get("local-models")!.handler("", ctx));
+    assert.equal(notices.length, 1);
+    const line = notices[0];
+    assert.ok(line.startsWith("info: local-models: 1 model(s) from http://127.0.0.1:8000"), line);
+    assert.ok(line.includes("qwen3.6-35b-a3b"), "the model id is shown");
+    assert.ok(line.includes("131072 ctx"), "the context window is shown");
+    assert.ok(line.includes("Q4_K_M"), "the quantization is shown");
+    assert.ok(line.includes("input text+image"), "the input modalities are shown");
+});
+
+test("/local-models: an empty catalog is a warning", async () => {
+    const { pi, dir } = await loadExtension(testConfig, { object: "list", data: [] });
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubFetch({ object: "list", data: [] }), () => pi.commands.get("local-models")!.handler("", ctx));
+    assert.equal(notices.length, 1);
+    assert.ok(notices[0].startsWith("warning: local-models: no models registered"), notices[0]);
+});
+
+test("/local-models: a missing config file is an error", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-project-"));
+    const emptyHome = mkdtempSync(join(tmpdir(), "pi-local-models-home-"));
+    const originalHome = process.env.HOME;
+    process.env.HOME = emptyHome;
+    const pi = fakePi();
+    const originalCwd = process.cwd();
+    process.chdir(dir);
+    try {
+        await extension(fakeApi(pi));
+        const { notices, ctx } = commandContext(pi);
+        await pi.commands.get("local-models")!.handler("", ctx);
+        assert.equal(notices.length, 1);
+        assert.ok(notices[0].startsWith("error: local-models: no local-models.json found"), notices[0]);
     } finally {
         process.chdir(originalCwd);
         process.env.HOME = originalHome;

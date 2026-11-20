@@ -5,3 +5,5 @@ package
 *.tgz
 package-lock.json
 .npmrc
+.pi
+tasks.md

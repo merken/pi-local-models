@@ -15,18 +15,44 @@ import { join } from "node:path";
 const DEFAULT_CTX_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
 const DEFAULT_INPUT: ModelInput[] = ["text"];
+const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_RETRY_ATTEMPTS = 3;
+const DEFAULT_RETRY_DELAY_MS = 1500;
 export const PROVIDER_NAME = "local-model";
+export const PROVIDER_LABEL = "Local models";
+
+let lastDiscovered: ServerModel[] = [];
+
+/** The raw entries from the most recent discovery, for the /local-models command. */
+export function getDiscoveredModels(): ServerModel[] {
+    return lastDiscovered;
+}
 
 export type ModelInput = "text" | "image";
 export type InputLimits = NonNullable<ProviderModelConfig["inputLimits"]>;
 
+export type ApiKeyHeader = "bearer" | "x-api-key" | "both";
+export type MaxTokensField = "max_tokens" | "max_completion_tokens";
+
+export interface RetryConfig {
+    attempts: number;
+    delayMs: number;
+}
+
 export interface LocalModelsConfig {
     url: string;
     apiKey?: string;
+    apiKeyHeader: ApiKeyHeader;
     contextWindow?: number;
     maxTokens: number;
     reasoning: boolean;
     input: ModelInput[];
+    timeoutMs: number;
+    maxTokensField?: MaxTokensField;
+    retry: RetryConfig;
+    /** Ask /api/show for a context length when the engine does not report one. */
+    contextProbe: boolean;
+    configPath: string;
 }
 
 interface LoadingPayload {
@@ -113,6 +139,61 @@ export interface ServerModel {
         failed?: boolean;
         exit_code?: number;
     };
+
+    // Quantization and size metadata (llama.cpp, ollama)
+    details?: {
+        quantization_level?: string;
+        parameter_size?: string;
+        format?: string;
+    };
+}
+
+export function positiveNumber(value: unknown, fallback: number): number {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+// Allow "$VAR" and "${VAR}" in url and apiKey, like pi's provider config.
+function expandEnv(value: string): string {
+    return value.replace(/\$(?:\{([A-Za-z0-9_]+)\}|([A-Za-z0-9_]+))/g, (match, braced, bare) => {
+        const name = braced ?? bare;
+        return process.env[name] ?? match;
+    });
+}
+
+const API_KEY_HEADERS: ApiKeyHeader[] = ["bearer", "x-api-key", "both"];
+
+/**
+ * A config file is usable when it names the engine and says how to authenticate it.
+ * Everything else has a default.
+ */
+function validateConfig(file: string, cfg: Record<string, unknown>): { url: string; apiKey?: string; apiKeyHeader: ApiKeyHeader } {
+    const rawUrl = cfg.url === undefined || cfg.url === null ? "" : expandEnv(String(cfg.url)).trim();
+    if (!rawUrl) {
+        throw new Error(`${file} must set "url"`);
+    }
+    if (!/^https?:\/\/[^\s]+$/i.test(rawUrl)) {
+        throw new Error(`${file} has an invalid "url": ${rawUrl}. It must start with http:// or https://`);
+    }
+
+    const apiKey = cfg.apiKey === undefined || cfg.apiKey === null || String(cfg.apiKey) === "" ? undefined : expandEnv(String(cfg.apiKey));
+    const header = cfg.apiKeyHeader === undefined ? undefined : String(cfg.apiKeyHeader);
+    if (apiKey && header === undefined) {
+        throw new Error(`${file} sets "apiKey" but no "apiKeyHeader". Set "bearer", "x-api-key", or "both".`);
+    }
+    if (header !== undefined && !API_KEY_HEADERS.includes(header as ApiKeyHeader)) {
+        throw new Error(`${file} has an invalid "apiKeyHeader": ${JSON.stringify(cfg.apiKeyHeader)}. Use "bearer", "x-api-key", or "both".`);
+    }
+
+    // Remove trailing v1
+    let url = rawUrl;
+    if (url.endsWith('/v1')) {
+        url = url.slice(0, -3);
+    } else if (url.endsWith('v1')) {
+        url = url.slice(0, -2);
+    }
+
+    return { url, apiKey, apiKeyHeader: (cfg.apiKeyHeader as ApiKeyHeader | undefined) ?? "both" };
 }
 
 export function readConfig(cwd: string): LocalModelsConfig {
@@ -126,82 +207,110 @@ export function readConfig(cwd: string): LocalModelsConfig {
     }
 
     const raw = readFileSync(file, "utf-8");
-    const cfg = JSON.parse(raw);
-    let url: string = '';
-    let apiKey: string | undefined = undefined;
-    let contextWindow: number | undefined = undefined;
-    let maxTokens: number = DEFAULT_MAX_TOKENS;
-    let input: ModelInput[] = [...DEFAULT_INPUT];
-    let reasoning: boolean = false;
-    if (cfg.url) {
-        // Remove trailing v1
-        url = cfg.url;
-        if (url.endsWith('/v1')) {
-            url = url.slice(0, -3);
-        } else if (url.endsWith('v1')) {
-            url = url.slice(0, -2);
-        }
+    let cfg: Record<string, unknown>;
+    try {
+        cfg = JSON.parse(raw) as Record<string, unknown>;
+    } catch (error) {
+        throw new Error(`${file} is not valid JSON: ${errorMessage(error)}`);
     }
 
-    if (cfg.apiKey)
-        apiKey = cfg.apiKey;
-
-    if (cfg.contextWindow)
-        contextWindow = cfg.contextWindow;
-
-    if (cfg.maxTokens)
-        maxTokens = cfg.maxTokens;
-
-    if (cfg.reasoning)
-        reasoning = cfg.reasoning;
-
-    if (Array.isArray(cfg.input)) {
-        // pi chat models accept only "text" and "image". Other modalities
-        // (for example "pdf" or "audio") are handled by the harness, not the model.
-        input = (cfg.input as unknown[]).filter((m): m is ModelInput => m === "text" || m === "image");
-    }
+    const { url, apiKey, apiKeyHeader } = validateConfig(file, cfg);
+    const retry = cfg.retry as RetryConfig | undefined;
+    const maxTokensField: MaxTokensField | undefined = ["max_tokens", "max_completion_tokens"].includes(String(cfg.maxTokensField))
+        ? (cfg.maxTokensField as MaxTokensField)
+        : undefined;
 
     return {
-        url: url,
-        apiKey: apiKey,
-        contextWindow: contextWindow,
-        maxTokens: maxTokens,
-        reasoning: reasoning,
-        input: input
+        url,
+        apiKey: apiKey || undefined,
+        apiKeyHeader,
+        contextWindow: typeof cfg.contextWindow === "number" && cfg.contextWindow > 0 ? cfg.contextWindow : undefined,
+        maxTokens: positiveNumber(cfg.maxTokens, DEFAULT_MAX_TOKENS),
+        reasoning: Boolean(cfg.reasoning),
+        input: Array.isArray(cfg.input)
+            // pi chat models accept only "text" and "image". Other modalities
+            // (for example "pdf" or "audio") are handled by the harness, not the model.
+            ? (cfg.input as unknown[]).filter((m): m is ModelInput => m === "text" || m === "image")
+            : [...DEFAULT_INPUT],
+        timeoutMs: positiveNumber(cfg.timeoutMs, DEFAULT_TIMEOUT_MS),
+        maxTokensField,
+        retry: {
+            attempts: positiveNumber(retry?.attempts, DEFAULT_RETRY_ATTEMPTS),
+            delayMs: positiveNumber(retry?.delayMs, DEFAULT_RETRY_DELAY_MS),
+        },
+        contextProbe: cfg.contextProbe !== false,
+        configPath: file,
     };
 }
 
-function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: string, body?: Record<string, unknown>, signal?: AbortSignal) {
-    const hasApiKey = config.apiKey ? true : false;
-    const postHeaders = { "Content-Type": "application/json" } as HeadersInit
-    const postHeadersWithApiKey = { "Content-Type": "application/json", "x-api-key": config.apiKey } as HeadersInit
-    const getHeaders = {} as HeadersInit
-    const getHeadersWithApiKey = { "x-api-key": config.apiKey } as HeadersInit
+export function authHeaders(config: LocalModelsConfig): Record<string, string> {
+    if (!config.apiKey) return {};
+    const bearer = { Authorization: `Bearer ${config.apiKey}` };
+    const apiKeyHeader = { "x-api-key": config.apiKey };
+    // pi sends a Bearer token when it calls the model. Discovery should match.
+    if (config.apiKeyHeader === "bearer") return bearer;
+    if (config.apiKeyHeader === "x-api-key") return apiKeyHeader;
+    return { ...bearer, ...apiKeyHeader };
+}
 
-    let headers: HeadersInit;
-    headers = getHeaders;
-    if (hasApiKey) {
-        headers = getHeadersWithApiKey;
-    }
-    if (method === 'POST') {
-        if (hasApiKey)
-            headers = postHeadersWithApiKey;
-        else
-            headers = postHeaders
-    }
-
-    return fetch(`${config.url}${endpoint}`, {
-        method: method,
-        headers: headers,
-        body: method === 'POST' ? JSON.stringify(body) : undefined,
-        signal,
-    }).then(async (res) => {
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`${res.status}: ${text.slice(0, 200)}`);
+async function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: string, body?: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort("timeout"), config.timeoutMs);
+    let onAbort: (() => void) | undefined;
+    if (signal) {
+        if (signal.aborted) controller.abort(signal.reason);
+        else {
+            onAbort = () => controller.abort(signal.reason);
+            signal.addEventListener("abort", onAbort, { once: true });
         }
-        return res.json();
-    });
+    }
+
+    const headers: Record<string, string> = { ...authHeaders(config) };
+    if (method === "POST") headers["Content-Type"] = "application/json";
+    const call = `${config.url}${endpoint}`;
+
+    try {
+        const response = await fetch(call, {
+            method: method,
+            headers: headers as HeadersInit,
+            body: method === "POST" ? JSON.stringify(body) : undefined,
+            signal: controller.signal,
+        });
+        // The engine answered. Stop the timeout so reading the body is not cut short.
+        clearTimeout(timer);
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(`${response.status}: ${text.slice(0, 200)}`);
+        }
+        return await response.json();
+    } catch (error) {
+        if (controller.signal.aborted && !signal?.aborted) {
+            throw new Error(`no response from ${call} within ${config.timeoutMs}ms`);
+        }
+        throw error;
+    } finally {
+        clearTimeout(timer);
+        if (signal && onAbort) signal.removeEventListener("abort", onAbort);
+    }
+}
+
+function hasContext(model: ServerModel): boolean {
+    return typeof model.context_length === "number" || typeof model.context_window === "number" || typeof model.max_model_len === "number" || typeof model.meta?.n_ctx === "number" || typeof model.n_ctx === "number";
+}
+
+/**
+ * Ollama reports no context length in /v1/models. Its /api/show endpoint does.
+ * Other engines answer 404, so the probe is cheap and ignored on failure.
+ */
+async function probeContextWindows(config: LocalModelsConfig, models: ServerModel[], signal?: AbortSignal): Promise<void> {
+    for (const model of models) {
+        const id = modelKey(model);
+        if (!id || hasContext(model)) continue;
+        const info = (await openAiApiCall(config, "/api/show", "POST", { name: id }, signal).catch(() => undefined)) as
+            { model?: { context_length?: number } } | undefined;
+        const contextLength = info?.model?.context_length;
+        if (typeof contextLength === "number" && contextLength > 0) model.context_length = contextLength;
+    }
 }
 
 export async function listModels(config: LocalModelsConfig, signal?: AbortSignal): Promise<ServerModel[]> {
@@ -209,17 +318,59 @@ export async function listModels(config: LocalModelsConfig, signal?: AbortSignal
         data?: ServerModel[];
         models?: ServerModel[];
     };
-    return normalizeModels(raw);
+    const models = normalizeModels(raw);
+    if (config.contextProbe) {
+        await probeContextWindows(config, models, signal);
+    }
+    return models;
 }
 
 /**
- * Model list for one provider refresh. Throws when the engine is unreachable, so
- * pi records the failure and the /local-models-refresh command can report it.
+ * Model list for one provider refresh. Retries while the engine is still booting.
+ * Throws when the engine is unreachable, so pi records the failure and
+ * /local-models-refresh can report it.
  */
 export async function discoverModels(config: LocalModelsConfig, signal?: AbortSignal): Promise<ProviderModelConfig[]> {
-    return (await listModels(config, signal))
-        .map((model) => toProviderModelConfig(model, config))
-        .filter((model): model is ProviderModelConfig => model !== undefined);
+    let serverModels: ServerModel[] = [];
+    for (let attempt = 1; attempt <= config.retry.attempts; attempt++) {
+        try {
+            serverModels = await listModels(config, signal);
+            break;
+        } catch (error) {
+            if (attempt === config.retry.attempts || signal?.aborted || !isRetryable(error)) throw error;
+            await sleep(config.retry.delayMs, signal);
+        }
+    }
+    lastDiscovered = serverModels;
+    return sortModels(
+        serverModels
+            .map((model) => toProviderModelConfig(model, config))
+            .filter((model): model is ProviderModelConfig => model !== undefined),
+    );
+}
+
+/** A hung engine or a bad key is not worth retrying. A refused connection is. */
+function isRetryable(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("within")) return false;
+    const status = Number(message.split(":")[0]);
+    return !(Number.isFinite(status) && status >= 400 && status < 500);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, ms);
+        if (signal) {
+            signal.addEventListener("abort", () => {
+                clearTimeout(timer);
+                reject(signal.reason instanceof Error ? signal.reason : new Error("refresh cancelled"));
+            }, { once: true });
+        }
+    });
+}
+
+export function sortModels(models: ProviderModelConfig[]): ProviderModelConfig[] {
+    return [...models].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 /** Unique key for a model entry. `data[].id` and `models[].name` are the same model. */
@@ -331,9 +482,32 @@ export function isChatModel(model: ServerModel): boolean {
     return true;
 }
 
+/**
+ * llama.cpp reports the GGUF file path as the model id. When the server also lists
+ * a clean alias, use it: the picker shows a readable id and the API accepts it.
+ */
+export function pickModelId(model: ServerModel): string {
+    const base = modelKey(model) ?? "";
+    if (!base.includes("/")) return base;
+    const alias = (model.aliases ?? []).find(
+        (value) => typeof value === "string" && value.length > 0 && !value.includes("/") && !value.endsWith(".gguf"),
+    );
+    return alias ?? base;
+}
+
+/** Splash reports reasoning efforts. Map them to pi thinking levels. */
+export function thinkingLevelMap(model: ServerModel): Record<string, string> | undefined {
+    const efforts = typeof model.reasoning === "object" && model.reasoning ? model.reasoning.efforts ?? [] : [];
+    const map: Record<string, string> = {};
+    for (const level of ["minimal", "low", "medium", "high", "xhigh", "max"]) {
+        if (efforts.includes(level)) map[level] = level;
+    }
+    return Object.keys(map).length > 0 ? map : undefined;
+}
+
 /** Map one server model entry to the pi ProviderModelConfig shape. */
 export function toProviderModelConfig(model: ServerModel, config: LocalModelsConfig): ProviderModelConfig | undefined {
-    const id = modelKey(model);
+    const id = pickModelId(model);
     if (!id || model.status?.failed === true || !isChatModel(model)) return undefined;
 
     const contextWindow = model.context_length ?? model.context_window ?? model.max_model_len ?? model.meta?.n_ctx ?? model.n_ctx ?? config.contextWindow ?? DEFAULT_CTX_WINDOW;
@@ -350,8 +524,11 @@ export function toProviderModelConfig(model: ServerModel, config: LocalModelsCon
         compat: {
             supportsDeveloperRole: false,
             supportsReasoningEffort: false,
+            ...(config.maxTokensField ? { maxTokensField: config.maxTokensField } : {}),
         },
     };
+    const levels = thinkingLevelMap(model);
+    if (levels) modelConfig.thinkingLevelMap = levels;
     const inputLimits = modelInputLimits(model);
     if (inputLimits) modelConfig.inputLimits = inputLimits;
     return modelConfig;
@@ -373,6 +550,7 @@ function report(ctx: ExtensionContext, message: string, type: "info" | "warning"
 /** Provider entry for pi. refreshModels re-reads the config, so edits apply without a reload. */
 function providerConfig(config: LocalModelsConfig, models: ProviderModelConfig[]): ProviderConfig {
     return {
+        name: PROVIDER_LABEL,
         baseUrl: `${config.url}/v1`,
         api: "openai-completions",
         apiKey: config.apiKey ?? "not-needed",
@@ -400,10 +578,13 @@ export default async function (pi: ExtensionAPI) {
         if (models.length === 0) {
             console.log("\x1b[31m", "local-models: No local models were discovered. Start the engine, then run /local-models-refresh");
         } else {
-            console.log("\x1b[36m%s\x1b[0m", "local-models: " + models.length + " local models were discovered, type /model to select a [local-model]");
-        }
 
-        pi.registerProvider(PROVIDER_NAME, providerConfig(config, models));
+            console.log("\x1b[36m%s\x1b[0m", "local-models: " + models.length + " local models were discovered, type /model to select a [local-model]");
+
+            pi.registerProvider(PROVIDER_NAME, providerConfig(config, models));
+
+            console.log("\x1b[36m", "local-models: providers registered succesfully.");
+        }
     }
 
     pi.registerCommand("local-models-refresh", {
@@ -448,4 +629,36 @@ export default async function (pi: ExtensionAPI) {
             report(ctx, `local-models: refreshed ${models.length} model(s): ${models.map((model) => model.name).join(", ")}. Use /model to select one.`, "info");
         },
     });
+
+    pi.registerCommand("local-models", {
+        description: "Show the local models this extension registered",
+        handler: async (_args, ctx) => {
+            let currentConfig: LocalModelsConfig;
+            try {
+                currentConfig = readConfig(process.cwd());
+            } catch (error) {
+                report(ctx, `local-models: ${errorMessage(error)}`, "error");
+                return;
+            }
+
+            const models = ctx.modelRegistry.getAll().filter((model) => model.provider === PROVIDER_NAME);
+            if (models.length === 0) {
+                report(ctx, `local-models: no models registered from ${currentConfig.url}. Run /local-models-refresh`, "warning");
+                return;
+            }
+
+            const raw = new Map(getDiscoveredModels().map((model) => [pickModelId(model), model]));
+            const lines = [`local-models: ${models.length} model(s) from ${currentConfig.url} (config: ${currentConfig.configPath})`];
+            for (const model of models) {
+                const entry = raw.get(model.id);
+                const quant = entry?.meta?.ftype || entry?.details?.quantization_level;
+                lines.push(
+                    `  ${model.name} [${model.id}] ${model.contextWindow} ctx, ${model.maxTokens} max tokens, ` +
+                    `input ${model.input.join("+")}, thinking ${model.reasoning ? "on" : "off"}${quant ? `, ${quant}` : ""}`,
+                );
+            }
+            report(ctx, lines.join("\n"), "info");
+        },
+    });
+    console.log("\x1b[36m", "local-models: extension loaded.");
 }

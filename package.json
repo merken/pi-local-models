@@ -5,13 +5,16 @@
     "license": "MIT",
     "scripts": {
         "test": "node --test tests/",
-        "typecheck": "tsc --noEmit --strict --target es2022 --module esnext --moduleResolution bundler --allowImportingTsExtensions extensions/local-models.ts tests/local-models.test.ts"
+        "typecheck": "tsc --noEmit --strict --skipLibCheck --target es2022 --module esnext --moduleResolution bundler --allowImportingTsExtensions extensions/local-models.ts tests/local-models.test.ts"
     },
     "keywords": [
         "pi-package"
     ],
     "peerDependencies": {
         "@earendil-works/pi-coding-agent": "^1.5.2"
+    },
+    "devDependencies": {
+        "typescript": "^7.0.2"
     },
     "pi": {
         "extensions": [

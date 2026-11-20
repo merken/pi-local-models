@@ -1,0 +1,33 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "/workspace/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "aliases": [
+        "/workspace/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+        "qwen3.6-35b-a3b"
+      ],
+      "object": "model",
+      "owned_by": "llamacpp",
+      "architecture": {
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"]
+      },
+      "meta": {
+        "n_ctx": 131072,
+        "n_ctx_train": 131072,
+        "ftype": "Q4_K - Medium"
+      }
+    }
+  ],
+  "models": [
+    {
+      "name": "/workspace/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "model": "/workspace/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+      "details": {
+        "format": "gguf",
+        "quantization_level": "Q4_K_M"
+      }
+    }
+  ]
+}

@@ -1,11 +1,18 @@
 {
     "url": "http://ai.local:8700",
     "apiKey": "1234",
+    "apiKeyHeader": "both",
     "contextWindow": 190000,
     "maxTokens": 65000,
     "reasoning": true,
     "input": [
         "text",
         "image"
-    ]
+    ],
+    "timeoutMs": 10000,
+    "retry": {
+        "attempts": 3,
+        "delayMs": 1500
+    },
+    "contextProbe": true
 }
