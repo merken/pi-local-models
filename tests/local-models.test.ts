@@ -9,6 +9,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import extension, {
+    PROVIDER_NAME,
+    discoverModels,
     isChatModel,
     listModels,
     modelInput,
@@ -22,9 +24,24 @@ import extension, {
     type ServerModel,
 } from "../extensions/local-models.ts";
 
+// A chat model entry: the ProviderModelConfig variant pi uses for text models.
 type ChatModel = Extract<ProviderModelConfig, { type?: "chat" }>;
+type CommandHandler = (args: string, ctx: unknown) => Promise<void>;
+
+interface FakePi {
+    providers: Map<string, ProviderConfig>;
+    commands: Map<string, { description?: string; handler: CommandHandler }>;
+}
+
+interface RecordedRequest {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    signal?: AbortSignal;
+}
 
 const fixturesDir = join(fileURLToPath(import.meta.url), "..", "fixtures");
+let requests: RecordedRequest[] = [];
 
 function fixture(name: string): unknown {
     return JSON.parse(readFileSync(join(fixturesDir, name), "utf-8"));
@@ -43,6 +60,15 @@ function config(overrides: Partial<LocalModelsConfig> = {}): LocalModelsConfig {
     };
 }
 
+const testConfig: LocalModelsConfig = {
+    url: "http://127.0.0.1:8000",
+    apiKey: "1234",
+    contextWindow: 190000,
+    maxTokens: 65000,
+    reasoning: true,
+    input: ["text", "image"],
+};
+
 // Normalized and mapped models for one provider response.
 function registeredModels(name: string, cfg: LocalModelsConfig = config()): ChatModel[] {
     return normalizeModels(fixture(name))
@@ -52,7 +78,7 @@ function registeredModels(name: string, cfg: LocalModelsConfig = config()): Chat
 }
 
 function byId(models: ChatModel[], id: string): ChatModel {
-    const model = models.find((m) => m.id === id);
+    const model = models.find((model) => model.id === id);
     assert.ok(model, `no model with id ${id}`);
     return model;
 }
@@ -76,42 +102,121 @@ function assertChatModel(model: ChatModel): void {
     assert.equal(compat?.supportsDeveloperRole, false);
     assert.equal(compat?.supportsReasoningEffort, false);
     if (model.inputLimits) {
-        assert.ok(typeof model.inputLimits.maxRequestBytes === "number" || typeof model.inputLimits.images === "object", "inputLimits must carry a limit");
+        assert.ok(
+            typeof model.inputLimits.maxRequestBytes === "number" || typeof model.inputLimits.images === "object",
+            "inputLimits must carry a limit",
+        );
     }
 }
 
-function writeConfig(dir: string, cfg: Record<string, unknown>): void {
+function writeConfig(dir: string, cfg: object): void {
     const agentDir = join(dir, ".pi", "agent");
     mkdirSync(agentDir, { recursive: true });
     writeFileSync(join(agentDir, "local-models.json"), JSON.stringify(cfg));
 }
 
-// Run the extension with a stubbed /v1/models response and a temp config file.
-async function registerProvider(payload: unknown, cfg: Record<string, unknown>): Promise<ProviderConfig | undefined> {
-    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-"));
-    writeConfig(dir, cfg);
+function stubFetch(payload: unknown): typeof fetch {
+    return ((url: string, options: { method?: string; headers?: HeadersInit; signal?: AbortSignal }) => {
+        requests.push({
+            url,
+            method: options.method ?? "GET",
+            headers: (options.headers ?? {}) as Record<string, string>,
+            signal: options.signal,
+        });
+        return Promise.resolve({ ok: true, json: () => payload, text: () => JSON.stringify(payload) } as unknown as Response);
+    }) as unknown as typeof fetch;
+}
 
+function stubErrorResponse(status: number, text: string): typeof fetch {
+    return (() =>
+        Promise.resolve({ ok: false, status, text: () => text, json: () => ({}) } as unknown as Response)) as unknown as typeof fetch;
+}
+
+// Run fn with a stubbed fetch and a temp working directory.
+async function runWithStub<T>(dir: string, fetchImpl: typeof fetch, fn: () => Promise<T>): Promise<T> {
     const originalCwd = process.cwd();
     const originalFetch = globalThis.fetch;
-    let registered: ProviderConfig | undefined;
-
-    globalThis.fetch = async () =>
-        ({ ok: true, json: async () => payload, text: async () => JSON.stringify(payload) }) as unknown as Response;
+    globalThis.fetch = fetchImpl;
     process.chdir(dir);
-
     try {
-        const api = {
-            registerProvider: (name: string, providerConfig: ProviderConfig) => {
-                registered = providerConfig;
-            },
-        } as unknown as ExtensionAPI;
-        await extension(api);
+        return await fn();
     } finally {
         process.chdir(originalCwd);
         globalThis.fetch = originalFetch;
     }
-    return registered;
 }
+
+function fakePi(): FakePi {
+    return { providers: new Map(), commands: new Map() };
+}
+
+function fakeApi(pi: FakePi): ExtensionAPI {
+    return {
+        registerProvider: (name: string, providerConfig: ProviderConfig) => pi.providers.set(name, providerConfig),
+        registerCommand: (name: string, command: { description?: string; handler: CommandHandler }) => pi.commands.set(name, command),
+    } as unknown as ExtensionAPI;
+}
+
+// Load the extension with a stubbed /v1/models response and a temp config file.
+async function loadExtension(configFile: object, payload: unknown, dir?: string): Promise<{ pi: FakePi; dir: string }> {
+    const workDir = dir ?? mkdtempSync(join(tmpdir(), "pi-local-models-"));
+    writeConfig(workDir, configFile);
+    const pi = fakePi();
+    requests = [];
+    await runWithStub(workDir, stubFetch(payload), async () => {
+        await extension(fakeApi(pi));
+    });
+    return { pi, dir: workDir };
+}
+
+// A command context with a model registry that runs the provider refreshModels callback.
+function commandContext(pi: FakePi, hasUI: boolean = true): { notices: string[]; ctx: unknown } {
+    const notices: string[] = [];
+    const ctx = {
+        mode: hasUI ? "tui" : "print",
+        hasUI,
+        ui: {
+            notify: (message: string, type: string = "info") => notices.push(`${type}: ${message}`),
+        },
+        modelRegistry: {
+            getProvider: (name: string) => (pi.providers.has(name) ? { id: name } : undefined),
+            getAll: () => (pi.providers.get(PROVIDER_NAME)?.models ?? []).map((model) => ({ ...model, provider: PROVIDER_NAME })),
+            refresh: async () => {
+                const errors = new Map<string, Error>();
+                const provider = pi.providers.get(PROVIDER_NAME);
+                if (provider?.refreshModels) {
+                    try {
+                        const models = await provider.refreshModels(refreshContext(new AbortController().signal));
+                        pi.providers.set(PROVIDER_NAME, { ...provider, models });
+                    } catch (error) {
+                        errors.set(PROVIDER_NAME, error as Error);
+                    }
+                }
+                return { aborted: false, errors };
+            },
+        },
+    };
+    return { notices, ctx };
+}
+
+function refreshContext(signal: AbortSignal): { allowNetwork: boolean; force: boolean; signal: AbortSignal; publish: () => Promise<boolean> } {
+    return { allowNetwork: true, force: true, signal, publish: async () => true };
+}
+
+function refreshModels(pi: FakePi, signal: AbortSignal): Promise<ChatModel[]> {
+    const provider = pi.providers.get(PROVIDER_NAME);
+    assert.ok(provider?.refreshModels, "the provider defines refreshModels");
+    return provider.refreshModels(refreshContext(signal)) as Promise<ChatModel[]>;
+}
+
+const providers: Array<{ name: string; fixture: string }> = [
+    { name: "splash", fixture: "splash.json" },
+    { name: "oMLX", fixture: "omlx.json" },
+    { name: "llama.cpp", fixture: "llamacpp.json" },
+    { name: "ollama", fixture: "ollama.json" },
+    { name: "llama-swap", fixture: "llama-swap.json" },
+    { name: "mtp-lx", fixture: "mtp-lx.json" },
+];
 
 test("splash: data[] and models[] are merged into one entry", () => {
     const entries = normalizeModels(fixture("splash.json"));
@@ -232,8 +337,7 @@ test("llama-swap: capabilities.in sets modalities and context_length sets the wi
 
 test("llama-swap: embedding and reranker models are not chat models", () => {
     const entries = normalizeModels(fixture("llama-swap.json"));
-    const ids = entries.map((entry) => modelKey(entry));
-    assert.deepEqual(ids, ["qwen3-8b-vision", "gte-modernbert", "gte-reranker"]);
+    assert.deepEqual(entries.map((entry) => modelKey(entry)), ["qwen3-8b-vision", "gte-modernbert", "gte-reranker"]);
     assert.deepEqual(entries.map(isChatModel), [true, false, false]);
     assert.equal(registeredModels("llama-swap.json").length, 1);
 });
@@ -248,38 +352,36 @@ test("mtp-lx: vlm models are kept and embedding models are skipped", () => {
 });
 
 test("unknown engine: a bare entry uses the config values", () => {
-    const entries = normalizeModels({ data: [{ id: "my-model", object: "model", created: 0 }] });
-    const [model] = entries
-        .map((entry) => toProviderModelConfig(entry, config({ contextWindow: 32768, maxTokens: 8192, reasoning: false, input: ["text"] })))
+    const models = normalizeModels({ data: [{ id: "my-model", object: "model", created: 0 }] })
+        .map((model) => toProviderModelConfig(model, config({ contextWindow: 32768, maxTokens: 8192, reasoning: false, input: ["text"] })))
         .filter((model): model is ProviderModelConfig => model !== undefined)
         .map((model) => model as ChatModel);
-    assertChatModel(model);
-    assert.equal(model!.contextWindow, 32768);
-    assert.equal(model!.maxTokens, 8192);
-    assert.equal(model!.reasoning, false);
-    assert.deepEqual(model!.input, ["text"]);
-    assert.equal(model!.name, "my-model");
+    assertChatModel(models[0]);
+    assert.equal(models[0].contextWindow, 32768);
+    assert.equal(models[0].maxTokens, 8192);
+    assert.equal(models[0].reasoning, false);
+    assert.deepEqual(models[0].input, ["text"]);
+    assert.equal(models[0].name, "my-model");
 });
 
 test("unknown engine: defaults apply when the config has no contextWindow", () => {
-    const [model] = normalizeModels({ data: [{ id: "tiny" }] })
-        .map((entry) => toProviderModelConfig(entry, config({ contextWindow: undefined, maxTokens: 999999 })))
+    const models = normalizeModels({ data: [{ id: "tiny" }] })
+        .map((model) => toProviderModelConfig(model, config({ contextWindow: undefined, maxTokens: 999999 })))
         .filter((model): model is ProviderModelConfig => model !== undefined)
         .map((model) => model as ChatModel);
-    assert.equal(model.contextWindow, 128000);
-    assert.equal(model.maxTokens, 128000);
+    assert.equal(models[0].contextWindow, 128000);
+    assert.equal(models[0].maxTokens, 128000);
 });
 
 test("edge cases: entries without an id or with a failed load are skipped", () => {
-    const entries = normalizeModels({
+    const models = normalizeModels({
         data: [
             { object: "model" },
             { id: "ok-model" },
             { id: "broken-model", status: { value: "failed", failed: true, exit_code: 1 } },
         ],
-    });
-    const models = entries
-        .map((entry) => toProviderModelConfig(entry, config()))
+    })
+        .map((model) => toProviderModelConfig(model, config()))
         .filter((model): model is ProviderModelConfig => model !== undefined)
         .map((model) => model as ChatModel);
     assert.equal(models.length, 1);
@@ -324,7 +426,7 @@ test("readConfig: input keeps only text and image", () => {
 });
 
 test("readConfig: the config file is read from the home directory when the project has none", () => {
-    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-home-"));
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-project-"));
     const home = mkdtempSync(join(tmpdir(), "pi-local-models-home-"));
     writeConfig(home, { url: "http://127.0.0.1:8080/v1", maxTokens: 2048 });
     const originalHome = process.env.HOME;
@@ -339,62 +441,171 @@ test("readConfig: the config file is read from the home directory when the proje
 });
 
 test("listModels: GET /v1/models is called with the api key header", async () => {
-    const originalFetch = globalThis.fetch;
-    let request: { url: string; method: string; headers: Record<string, string> } | undefined;
-    globalThis.fetch = ((url: string, options: { method?: string; headers?: HeadersInit }) => {
-        request = { url, method: options.method ?? "GET", headers: (options.headers ?? {}) as Record<string, string> };
-        return Promise.resolve({ ok: true, json: () => fixture("omlx.json"), text: () => "" } as unknown as Response);
-    }) as unknown as typeof fetch;
-    try {
-        const models = await listModels(config());
-        assert.equal(request?.url, "http://127.0.0.1:8000/v1/models");
-        assert.equal(request?.method, "GET");
-        assert.equal(request?.headers["x-api-key"], "1234");
-        assert.equal(models.length, 8);
-    } finally {
-        globalThis.fetch = originalFetch;
-    }
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-"));
+    writeConfig(dir, testConfig);
+    requests = [];
+    const models = await runWithStub(dir, stubFetch(fixture("omlx.json")), () => listModels(config(testConfig as LocalModelsConfig)));
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "http://127.0.0.1:8000/v1/models");
+    assert.equal(requests[0].method, "GET");
+    assert.equal(requests[0].headers["x-api-key"], "1234");
+    assert.equal(models.length, 8);
 });
 
 test("listModels: an unavailable server throws with the status code", async () => {
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = (() => Promise.resolve({ ok: false, status: 503, text: async () => "model not loaded" })) as unknown as typeof fetch;
-    try {
-        await assert.rejects(() => listModels(config()), /503: model not loaded/);
-    } finally {
-        globalThis.fetch = originalFetch;
-    }
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-"));
+    writeConfig(dir, testConfig);
+    await runWithStub(dir, stubErrorResponse(503, "model not loaded"), async () => {
+        await assert.rejects(() => listModels(config(testConfig as LocalModelsConfig)), /503: model not loaded/);
+    });
 });
 
-const providers: Array<{ name: string; fixture: string }> = [
-    { name: "splash", fixture: "splash.json" },
-    { name: "oMLX", fixture: "omlx.json" },
-    { name: "llama.cpp", fixture: "llamacpp.json" },
-    { name: "ollama", fixture: "ollama.json" },
-    { name: "llama-swap", fixture: "llama-swap.json" },
-    { name: "mtp-lx", fixture: "mtp-lx.json" },
-];
+test("discoverModels: the same response maps to model entries", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-"));
+    writeConfig(dir, testConfig);
+    const models = await runWithStub(dir, stubFetch(fixture("splash.json")), () =>
+        discoverModels(config(testConfig)),
+    );
+    assert.equal(models.length, 1);
+    assert.equal(models[0].id, "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M");
+});
 
 for (const provider of providers) {
     test(`${provider.name}: the provider is registered with valid model entries`, async () => {
-        const registered = await registerProvider(fixture(provider.fixture), {
-            url: "http://127.0.0.1:8000",
-            apiKey: "1234",
-            contextWindow: 190000,
-            maxTokens: 65000,
-            reasoning: true,
-            input: ["text", "image"],
-        });
+        const { pi } = await loadExtension(testConfig, fixture(provider.fixture));
+        const registered = pi.providers.get(PROVIDER_NAME);
         assert.ok(registered, "registerProvider was called");
         assert.equal(registered.baseUrl, "http://127.0.0.1:8000/v1");
         assert.equal(registered.api, "openai-completions");
         assert.equal(registered.apiKey, "1234");
         assert.ok(registered.models && registered.models.length > 0, "at least one model is registered");
+        assert.ok(registered.refreshModels, "the provider can refresh its model list");
         (registered.models as ProviderModelConfig[]).forEach((model) => assertChatModel(model as ChatModel));
+    });
+
+    test(`${provider.name}: refreshModels returns the same list as startup discovery`, async () => {
+        const { pi, dir } = await loadExtension(testConfig, fixture(provider.fixture));
+        const models = await runWithStub(dir, stubFetch(fixture(provider.fixture)), () =>
+            refreshModels(pi, new AbortController().signal),
+        );
+        const expected = registeredModels(provider.fixture, config(testConfig as LocalModelsConfig));
+        assert.deepEqual(models.map((model) => model.id), expected.map((model) => model.id));
+        models.forEach(assertChatModel);
     });
 }
 
-test("a server with no models does not register a provider", async () => {
-    const registered = await registerProvider({ object: "list", data: [] }, { url: "http://127.0.0.1:8000" });
-    assert.equal(registered, undefined);
+test("refreshModels: the abort signal is passed to fetch", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    const controller = new AbortController();
+    requests = [];
+    await runWithStub(dir, stubFetch(fixture("omlx.json")), () => refreshModels(pi, controller.signal));
+    assert.equal(requests[requests.length - 1].url, "http://127.0.0.1:8000/v1/models");
+    assert.equal(requests[requests.length - 1].signal, controller.signal);
+});
+
+test("refreshModels: an unreachable engine reports the error", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    await runWithStub(dir, stubErrorResponse(503, "model not loaded"), async () => {
+        await assert.rejects(() => refreshModels(pi, new AbortController().signal), /503: model not loaded/);
+    });
+});
+
+test("refreshModels: a config file edited after startup is used", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    writeConfig(dir, { ...testConfig, url: "http://127.0.0.1:9000", maxTokens: 4096 });
+    const models = await runWithStub(dir, stubFetch(fixture("splash.json")), () => refreshModels(pi, new AbortController().signal));
+    assert.equal(models.length, 1);
+    assert.equal(models[0].maxTokens, 4096);
+    assert.equal(requests[requests.length - 1].url, "http://127.0.0.1:9000/v1/models");
+});
+
+test("/local-models-refresh: the command is registered", async () => {
+    const { pi } = await loadExtension(testConfig, fixture("omlx.json"));
+    const command = pi.commands.get("local-models-refresh");
+    assert.ok(command, "the command is registered");
+    assert.ok(command.description, "the command has a description");
+});
+
+test("/local-models-refresh: models discovered after startup are added", async () => {
+    const { pi, dir } = await loadExtension(testConfig, { object: "list", data: [] });
+    assert.equal(pi.providers.get(PROVIDER_NAME)!.models!.length, 0, "no models at startup");
+
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubFetch(fixture("omlx.json")), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+
+    const models = pi.providers.get(PROVIDER_NAME)!.models! as ChatModel[];
+    assert.equal(models.length, 8);
+    assert.equal(notices.length, 1);
+    assert.ok(notices[0].startsWith("info: local-models: refreshed 8 model(s)"), notices[0]);
+    assert.ok(notices[0].includes("/model"), "the notice points the user to /model");
+});
+
+test("/local-models-refresh: a replaced catalog is reported", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubFetch(fixture("llamacpp.json")), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+    const models = pi.providers.get(PROVIDER_NAME)!.models! as ChatModel[];
+    assert.equal(models.length, 1);
+    assert.equal(models[0].name, "Qwen3.6-35B-A3B-UD-Q4_K_M");
+    assert.ok(notices[0].includes("refreshed 1 model(s)"), notices[0]);
+});
+
+test("/local-models-refresh: an unreachable engine is reported as an error", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubErrorResponse(503, "model not loaded"), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+    assert.equal(notices.length, 1);
+    assert.ok(notices[0].startsWith("error: local-models: refresh failed"), notices[0]);
+    assert.ok(notices[0].includes("http://127.0.0.1:8000"), "the notice names the server url");
+});
+
+test("/local-models-refresh: the result is printed when there is no TUI", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    const { ctx } = commandContext(pi, false);
+    const originalLog = console.log;
+    const lines: string[] = [];
+    console.log = (message: unknown) => lines.push(String(message));
+    try {
+        await runWithStub(dir, stubFetch(fixture("llamacpp.json")), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+    } finally {
+        console.log = originalLog;
+    }
+    assert.equal(lines.length, 1);
+    assert.ok(lines[0].includes("local-models: refreshed 1 model(s)"), lines[0]);
+});
+
+test("/local-models-refresh: a server with no chat models is reported as a warning", async () => {
+    const { pi, dir } = await loadExtension(testConfig, fixture("omlx.json"));
+    const { notices, ctx } = commandContext(pi);
+    await runWithStub(dir, stubFetch({ object: "list", data: [] }), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+    assert.equal(notices.length, 1);
+    assert.ok(notices[0].startsWith("warning: local-models: the server returned no models"), notices[0]);
+});
+
+test("/local-models-refresh: the provider is created when the config appeared after startup", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-local-models-project-"));
+    const emptyHome = mkdtempSync(join(tmpdir(), "pi-local-models-home-"));
+    const originalHome = process.env.HOME;
+    process.env.HOME = emptyHome;
+
+    const pi = fakePi();
+    const originalCwd = process.cwd();
+    process.chdir(dir);
+    try {
+        await extension(fakeApi(pi));
+        assert.equal(pi.providers.size, 0, "no provider without a config file");
+        assert.ok(pi.commands.has("local-models-refresh"), "the command is still registered");
+
+        writeConfig(dir, testConfig);
+        const { notices, ctx } = commandContext(pi);
+        await runWithStub(dir, stubFetch(fixture("llamacpp.json")), () => pi.commands.get("local-models-refresh")!.handler("", ctx));
+
+        const models = pi.providers.get(PROVIDER_NAME)!.models! as ChatModel[];
+        assert.equal(models.length, 1);
+        assert.equal(models[0].name, "Qwen3.6-35B-A3B-UD-Q4_K_M");
+        assert.ok(notices[0].includes("refreshed 1 model(s)"), notices[0]);
+    } finally {
+        process.chdir(originalCwd);
+        process.env.HOME = originalHome;
+    }
 });

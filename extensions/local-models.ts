@@ -7,7 +7,7 @@
 // - Windows: %USERPROFILE%/.pi/agent/local-models.json
 // - macOs/Linux: ~/.pi/agent/local-models.json
 
-import type { ExtensionAPI, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProviderConfig, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import { join } from "node:path";
 const DEFAULT_CTX_WINDOW = 128000;
 const DEFAULT_MAX_TOKENS = 16384;
 const DEFAULT_INPUT: ModelInput[] = ["text"];
+export const PROVIDER_NAME = "local-model";
 
 export type ModelInput = "text" | "image";
 export type InputLimits = NonNullable<ProviderModelConfig["inputLimits"]>;
@@ -170,7 +171,7 @@ export function readConfig(cwd: string): LocalModelsConfig {
     };
 }
 
-function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: string, body?: Record<string, unknown>) {
+function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: string, body?: Record<string, unknown>, signal?: AbortSignal) {
     const hasApiKey = config.apiKey ? true : false;
     const postHeaders = { "Content-Type": "application/json" } as HeadersInit
     const postHeadersWithApiKey = { "Content-Type": "application/json", "x-api-key": config.apiKey } as HeadersInit
@@ -193,6 +194,7 @@ function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: stri
         method: method,
         headers: headers,
         body: method === 'POST' ? JSON.stringify(body) : undefined,
+        signal,
     }).then(async (res) => {
         if (!res.ok) {
             const text = await res.text();
@@ -202,12 +204,22 @@ function openAiApiCall(config: LocalModelsConfig, endpoint: string, method: stri
     });
 }
 
-export async function listModels(config: LocalModelsConfig): Promise<ServerModel[]> {
-    const raw = (await openAiApiCall(config, "/v1/models", "GET")) as {
+export async function listModels(config: LocalModelsConfig, signal?: AbortSignal): Promise<ServerModel[]> {
+    const raw = (await openAiApiCall(config, "/v1/models", "GET", undefined, signal)) as {
         data?: ServerModel[];
         models?: ServerModel[];
     };
     return normalizeModels(raw);
+}
+
+/**
+ * Model list for one provider refresh. Throws when the engine is unreachable, so
+ * pi records the failure and the /local-models-refresh command can report it.
+ */
+export async function discoverModels(config: LocalModelsConfig, signal?: AbortSignal): Promise<ProviderModelConfig[]> {
+    return (await listModels(config, signal))
+        .map((model) => toProviderModelConfig(model, config))
+        .filter((model): model is ProviderModelConfig => model !== undefined);
 }
 
 /** Unique key for a model entry. `data[].id` and `models[].name` are the same model. */
@@ -345,29 +357,95 @@ export function toProviderModelConfig(model: ServerModel, config: LocalModelsCon
     return modelConfig;
 }
 
-export default async function (pi: ExtensionAPI) {
-    const config = readConfig(process.cwd());
-    const serverModels = await listModels(config).catch((): ServerModel[] => []);
-    if (serverModels.length === 0) {
-        console.log("\x1b[31m", "local-models: " + "No local models were discovered");
-        return;
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+// The TUI shows notifications. Print mode and rpc mode have no notification surface.
+function report(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error"): void {
+    if (ctx.hasUI) {
+        ctx.ui.notify(message, type);
+    } else {
+        console.log(message);
     }
+}
 
-    console.log('\x1b[36m%s\x1b[0m', "local-models: " + serverModels.length + " local models were discovered, type /model to select a [local-model]");
-
-    const models = serverModels
-        .map((model) => toProviderModelConfig(model, config))
-        .filter((model): model is ProviderModelConfig => model !== undefined);
-
-    if (models.length === 0) {
-        console.log("\x1b[31m", "local-models: no usable model entry in /v1/models");
-        return;
-    }
-
-    pi.registerProvider("local-model", {
+/** Provider entry for pi. refreshModels re-reads the config, so edits apply without a reload. */
+function providerConfig(config: LocalModelsConfig, models: ProviderModelConfig[]): ProviderConfig {
+    return {
         baseUrl: `${config.url}/v1`,
         api: "openai-completions",
         apiKey: config.apiKey ?? "not-needed",
-        models
+        models,
+        refreshModels: async ({ signal }) => discoverModels(readConfig(process.cwd()), signal),
+    };
+}
+
+export default async function (pi: ExtensionAPI) {
+    let config: LocalModelsConfig | undefined;
+    try {
+        config = readConfig(process.cwd());
+    } catch (error) {
+        console.log("\x1b[31m", `local-models: ${errorMessage(error)}`);
+    }
+
+    if (config) {
+        let models: ProviderModelConfig[] = [];
+        try {
+            models = await discoverModels(config);
+        } catch (error) {
+            console.log("\x1b[31m", `local-models: ${errorMessage(error)}`);
+        }
+
+        if (models.length === 0) {
+            console.log("\x1b[31m", "local-models: No local models were discovered. Start the engine, then run /local-models-refresh");
+        } else {
+            console.log("\x1b[36m%s\x1b[0m", "local-models: " + models.length + " local models were discovered, type /model to select a [local-model]");
+        }
+
+        pi.registerProvider(PROVIDER_NAME, providerConfig(config, models));
+    }
+
+    pi.registerCommand("local-models-refresh", {
+        description: "Ask the local inference server for its model list again",
+        handler: async (_args, ctx) => {
+            // The config file may appear or change after pi started.
+            let currentConfig: LocalModelsConfig;
+            try {
+                currentConfig = readConfig(process.cwd());
+            } catch (error) {
+                report(ctx, `local-models: ${errorMessage(error)}`, "error");
+                return;
+            }
+
+            if (!ctx.modelRegistry.getProvider(PROVIDER_NAME)) {
+                pi.registerProvider(PROVIDER_NAME, providerConfig(currentConfig, []));
+            }
+
+            const result = await ctx.modelRegistry.refresh({
+                providers: [PROVIDER_NAME],
+                allowNetwork: true,
+                force: true,
+            });
+
+            if (result.aborted) {
+                report(ctx, "local-models: refresh was cancelled", "warning");
+                return;
+            }
+
+            const error = result.errors.get(PROVIDER_NAME);
+            if (error) {
+                report(ctx, `local-models: refresh failed: ${error.message}. Is the engine running at ${currentConfig.url}?`, "error");
+                return;
+            }
+
+            const models = ctx.modelRegistry.getAll().filter((model) => model.provider === PROVIDER_NAME);
+            if (models.length === 0) {
+                report(ctx, "local-models: the server returned no models", "warning");
+                return;
+            }
+
+            report(ctx, `local-models: refreshed ${models.length} model(s): ${models.map((model) => model.name).join(", ")}. Use /model to select one.`, "info");
+        },
     });
-};
+}

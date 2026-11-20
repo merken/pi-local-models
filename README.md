@@ -48,6 +48,19 @@ Each engine reports models slightly differently. The extension reads both `data[
 Fields the engine does not report fall back to `local-models.json` (`contextWindow`,
 `maxTokens`, `reasoning`, `input`).
 
+## Refresh the model list
+
+The engine often starts after Pi. Run this command in the TUI:
+
+```
+/local-models-refresh
+```
+
+The command re-reads `local-models.json`, fetches `/v1/models` again, and replaces the
+`[local-model]` entries. Then run `/model` to select one. Pi also calls the provider's
+`refreshModels` during its normal model refresh, so `/model` picks up newly loaded
+models without a restart.
+
 ## Tests
 
 ```
