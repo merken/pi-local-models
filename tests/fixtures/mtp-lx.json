@@ -1,0 +1,21 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "mtplx-qwen38-27b-optimized-speed",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "mtp-lx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "mtplx-embedding-mini",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "mtp-lx",
+      "model_type": "embedding",
+      "max_model_len": 8192
+    }
+  ]
+}

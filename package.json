@@ -1,13 +1,17 @@
 {
     "name": "pi-local-models",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "description": "Pi extension for any local model harness - model discovery, per-project config",
     "license": "MIT",
+    "scripts": {
+        "test": "node --test tests/",
+        "typecheck": "tsc --noEmit --strict --target es2022 --module esnext --moduleResolution bundler --allowImportingTsExtensions extensions/local-models.ts tests/local-models.test.ts"
+    },
     "keywords": [
         "pi-package"
     ],
     "peerDependencies": {
-        "@mariozechner/pi-coding-agent": "*"
+        "@earendil-works/pi-coding-agent": "^1.5.2"
     },
     "pi": {
         "extensions": [

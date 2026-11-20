@@ -1,0 +1,51 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "qwen3-8b-vision",
+      "object": "model",
+      "created": 1775097337,
+      "owned_by": "llamaswap",
+      "context_length": 60160,
+      "context_window": 60160,
+      "capabilities": {
+        "in": ["text", "image"],
+        "out": ["text"],
+        "tools": true
+      },
+      "meta": {
+        "llamaswap": {
+          "state": "stopped",
+          "ttl": 300
+        },
+        "n_ctx": 60160
+      }
+    },
+    {
+      "id": "gte-modernbert",
+      "object": "model",
+      "created": 1775097337,
+      "owned_by": "llamaswap",
+      "capabilities": {
+        "in": ["text"],
+        "out": ["embedding"],
+        "embeddings": true
+      }
+    },
+    {
+      "id": "gte-reranker",
+      "object": "model",
+      "created": 1775097337,
+      "owned_by": "llamaswap",
+      "capabilities": {
+        "reranker": true
+      },
+      "meta": {
+        "llamaswap": {
+          "context_window": 8192
+        },
+        "n_ctx": 8192
+      }
+    }
+  ]
+}

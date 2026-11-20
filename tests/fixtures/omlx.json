@@ -1,0 +1,69 @@
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "Jundot--Qwen3.8-27B-oQ4e-fp16-mtp",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "Jundot--Qwen3.8-27B-oQ4e-mtp",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "Jundot--Qwen3.8-27B-oQ4h-mtp",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "Jundot--gemma-4-26B-A4B-it-oQ4e-mtp",
+      "object": "model",
+      "created": 1795159475,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "Qwen3.6-35B-A3B-UD-Q4_K_M",
+      "object": "model",
+      "created": 1795159476,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "incoai--Qwen3.6-35B-A3B-DFlash2",
+      "object": "model",
+      "created": 1795159476,
+      "owned_by": "omlx",
+      "model_type": "llm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "incoai--Qwen3.8-27B-DFlash2",
+      "object": "model",
+      "created": 1795159476,
+      "owned_by": "omlx",
+      "model_type": "llm",
+      "max_model_len": 131072
+    },
+    {
+      "id": "mlx-community--Qwen3.8-27B-4bit",
+      "object": "model",
+      "created": 1795159476,
+      "owned_by": "omlx",
+      "model_type": "vlm",
+      "max_model_len": 163840
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "models": [
+    {
+      "name": "llama3.2:latest",
+      "model": "llama3.2:latest",
+      "modified_at": "2025-01-04T12:00:00Z",
+      "size": 2011735053,
+      "digest": "sha256:3862e151414d309d3a1f3f7c1a0e4d5f8f1e8f9a1b2c3d4e5f6a7b8c9d0e1f2a",
+      "type": "model",
+      "description": "",
+      "tags": [],
+      "capabilities": ["completion"],
+      "parameters": "",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "llama",
+        "families": ["llama"],
+        "parameter_size": "3.2B",
+        "quantization_level": "Q4_K_M"
+      }
+    },
+    {
+      "name": "llama3.2-vision:latest",
+      "model": "llama3.2-vision:latest",
+      "modified_at": "2025-01-04T12:05:00Z",
+      "size": 3500000000,
+      "digest": "sha256:aaa",
+      "type": "model",
+      "description": "",
+      "tags": [],
+      "capabilities": ["completion", "vision"],
+      "parameters": "",
+      "details": {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "llama",
+        "families": ["llama"],
+        "parameter_size": "3.2B",
+        "quantization_level": "Q4_K_M"
+      }
+    }
+  ]
+}
